@@ -270,7 +270,7 @@ export default function UpgradePage() {
               Teste Premium pendant 30 jours. Si ça ne t'aide pas, on te rembourse intégralement.
               Zéro question, zéro tracas. Promis! 🤝
             </p>
-          </card>
+          </Card>
         </motion.div>
 
         {/* FAQ */}

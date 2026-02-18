@@ -410,7 +410,7 @@ export const availableTests = [
 
 ## 📞 Support
 
-- **Email**: support@declic.fr (à configurer)
+- **Email**: support@déclik.fr (à configurer)
 - **Issues GitHub**: [Créer une issue](https://github.com/...)
 - **Documentation**: Ce README
 

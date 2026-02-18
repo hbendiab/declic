@@ -1,166 +1,235 @@
 #!/usr/bin/env python3
 """
-Script pour créer la base de données RAG pour les métiers APEC
-Transforme les 446 métiers en embeddings et les stocke dans ChromaDB
+Script pour créer la base de données RAG pour les métiers DÉCLIC
+Utilise LangChain + OpenAI Embeddings + ChromaDB
 """
 
 import json
 import os
+import shutil
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.config import Settings
+from dotenv import load_dotenv
+
+# Charger les variables d'environnement
+load_dotenv(".env.local")
+
+try:
+    from langchain_openai import OpenAIEmbeddings
+    from langchain_community.vectorstores import Chroma
+    from langchain_core.documents import Document
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError as e:
+    print(f"❌ Erreur d'import: {e}")
+    print("\n📦 Installez les dépendances:")
+    print("pip install langchain langchain-openai langchain-community chromadb python-dotenv")
+    exit(1)
+
 
 def setup_rag_database():
-    """Configure la base de données RAG avec les métiers APEC"""
+    """Configure la base de données RAG avec les métiers DÉCLIC"""
 
     print("🚀 CRÉATION DE LA BASE DE DONNÉES RAG")
-    print("="*70)
+    print("=" * 70)
 
-    # ÉTAPE 1: Charger les données métiers
+    # ──────────────────────────────────────────────────────────────────────────
+    # ÉTAPE 1: Vérifier la clé API
+    # ──────────────────────────────────────────────────────────────────────────
+    api_key = os.getenv("OPENAI_API_KEY")
+    
+    if not api_key:
+        print("❌ ERREUR: OPENAI_API_KEY manquante dans .env.local")
+        print("\n📋 Créez un fichier .env.local à la racine avec:")
+        print("OPENAI_API_KEY=sk-proj-votre-clé-ici")
+        exit(1)
+    
+    if api_key in ("sk-your-key-here", "sk-proj-votre-clé-ici"):
+        print("❌ ERREUR: Remplacez la clé placeholder par votre vraie clé OpenAI!")
+        exit(1)
+
+    print("✓ Clé OpenAI trouvée")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # ÉTAPE 2: Charger les données métiers
+    # ──────────────────────────────────────────────────────────────────────────
     print("\n📂 Chargement des données métiers...")
-    jobs_file = "data/jobs/apec-jobs.json"
-
-    with open(jobs_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    jobs = data['jobs']
-    print(f"✓ {len(jobs)} métiers chargés depuis {jobs_file}")
-
-    # ÉTAPE 2: Initialiser le modèle d'embeddings (français)
-    print("\n🧠 Chargement du modèle d'embeddings (paraphrase-multilingual)...")
-    print("   Note: Téléchargement du modèle (~420 MB) si première fois...")
-
-    # Modèle multilingue qui comprend bien le français
-    model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-    print("✓ Modèle chargé!")
-
-    # ÉTAPE 3: Créer/Connecter à ChromaDB
-    print("\n💾 Initialisation de ChromaDB...")
-
-    # Créer le dossier pour ChromaDB
-    chroma_dir = Path("data/chroma_db")
-    chroma_dir.mkdir(parents=True, exist_ok=True)
-
-    # Initialiser le client ChromaDB
-    client = chromadb.PersistentClient(
-        path=str(chroma_dir),
-        settings=Settings(
-            anonymized_telemetry=False,
-            allow_reset=True
-        )
-    )
-
-    # Supprimer la collection si elle existe (pour réinitialiser)
+    
+    # Chercher le fichier à plusieurs emplacements
+    possible_paths = [
+        "data/jobs/apec-jobs.json",
+        "data/jobs/jobs.json",
+        "./data/jobs/apec-jobs.json",
+        "../../data/jobs/apec-jobs.json",
+    ]
+    
+    jobs_file = None
+    for path in possible_paths:
+        if Path(path).exists():
+            jobs_file = path
+            break
+    
+    if not jobs_file:
+        print("❌ ERREUR: Fichier métiers non trouvé!")
+        print(f"   Cherché à: {possible_paths}")
+        print("\n📋 Créez d'abord les métiers avec:")
+        print("python scrape-apec-js.py")
+        exit(1)
+    
     try:
-        client.delete_collection("jobs")
-        print("✓ Ancienne collection supprimée")
-    except:
-        pass
+        with open(jobs_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        jobs = data.get('jobs', [])
+        print(f"✓ {len(jobs)} métiers chargés depuis {jobs_file}")
+    except json.JSONDecodeError:
+        print(f"❌ ERREUR: {jobs_file} n'est pas un JSON valide")
+        exit(1)
+    except Exception as e:
+        print(f"❌ ERREUR lors de la lecture: {e}")
+        exit(1)
 
-    # Créer une nouvelle collection
-    collection = client.create_collection(
-        name="jobs",
-        metadata={"description": "APEC jobs database"}
-    )
-    print(f"✓ Collection 'jobs' créée dans {chroma_dir}")
+    if not jobs:
+        print("❌ ERREUR: Aucun métier trouvé dans le fichier!")
+        exit(1)
 
-    # ÉTAPE 4: Préparer les documents pour l'embedding
-    print(f"\n📝 Préparation de {len(jobs)} métiers pour vectorisation...")
-
-    documents = []
-    metadatas = []
-    ids = []
-
-    for idx, job in enumerate(jobs):
-        # Créer un texte riche pour l'embedding
-        # Combine titre, description, missions, compétences
-        job_text = f"""
-Titre: {job['title']}
-Secteur: {job['sector']}
-Description: {job.get('description', '')}
-Missions: {job.get('missions', '')}
+    # ──────────────────────────────────────────────────────────────────────────
+    # ÉTAPE 3: Construire les Documents LangChain
+    # ──────────────────────────────────────────────────────────────────────────
+    print(f"\n📝 Création de {len(jobs)} documents LangChain...")
+    
+    raw_documents = []
+    
+    for job in jobs:
+        try:
+            # Formater le contenu du document
+            content = f"""Métier: {job.get('title', 'N/A')}
+Secteur: {job.get('sector', 'N/A')}
+Description: {job.get('description', 'N/A')}
 Compétences: {', '.join(job.get('required_skills', [])[:5])}
 Formation: {', '.join(job.get('required_education', []))}
-Salaire: {job['salary']['min']}-{job['salary']['max']} {job['salary']['currency']}
-        """.strip()
+Salaire: {job.get('salary', {}).get('min', 'N/A')}-{job.get('salary', {}).get('max', 'N/A')} EUR"""
 
-        documents.append(job_text)
+            metadata = {
+                'title': job.get('title', 'N/A'),
+                'sector': job.get('sector', 'N/A'),
+                'salary_min': str(job.get('salary', {}).get('min', 0)),
+                'salary_max': str(job.get('salary', {}).get('max', 0)),
+                'slug': job.get('slug', ''),
+            }
 
-        # Métadonnées pour filtrage et affichage
-        metadatas.append({
-            'title': job['title'],
-            'sector': job['sector'],
-            'salary_min': job['salary']['min'],
-            'salary_max': job['salary']['max'],
-            'slug': job['slug'],
-            'url': job.get('url', '')
-        })
+            raw_documents.append(Document(page_content=content, metadata=metadata))
+        except Exception as e:
+            print(f"⚠️  Erreur avec métier {job.get('title', 'N/A')}: {e}")
+            continue
 
-        ids.append(f"job_{idx}")
+    print(f"✓ {len(raw_documents)} documents créés")
 
-    print("✓ Documents préparés")
+    if not raw_documents:
+        print("❌ ERREUR: Aucun document valide créé!")
+        exit(1)
 
-    # ÉTAPE 5: Créer les embeddings et stocker dans ChromaDB
-    print(f"\n🔄 Création des embeddings pour {len(documents)} métiers...")
-    print("   (Cela peut prendre 2-3 minutes...)")
-
-    # Créer les embeddings par batch pour plus d'efficacité
-    batch_size = 32
-    for i in range(0, len(documents), batch_size):
-        batch_docs = documents[i:i+batch_size]
-        batch_meta = metadatas[i:i+batch_size]
-        batch_ids = ids[i:i+batch_size]
-
-        # Créer les embeddings
-        embeddings = model.encode(batch_docs, show_progress_bar=True)
-
-        # Ajouter à ChromaDB
-        collection.add(
-            embeddings=embeddings.tolist(),
-            documents=batch_docs,
-            metadatas=batch_meta,
-            ids=batch_ids
+    # ──────────────────────────────────────────────────────────────────────────
+    # ÉTAPE 4: Découper avec RecursiveCharacterTextSplitter
+    # ──────────────────────────────────────────────────────────────────────────
+    print("\n✂️  Découpage des documents...")
+    
+    try:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50,
+            separators=["\n\n", "\n", " ", ""],
         )
+        split_docs = splitter.split_documents(raw_documents)
+        print(f"✓ {len(split_docs)} chunks créés")
+    except Exception as e:
+        print(f"❌ ERREUR lors du découpage: {e}")
+        exit(1)
 
-        print(f"   ✓ Batch {i//batch_size + 1}/{(len(documents) + batch_size - 1)//batch_size} ajouté")
+    # ──────────────────────────────────────────────────────────────────────────
+    # ÉTAPE 5: Initialiser OpenAI Embeddings
+    # ──────────────────────────────────────────────────────────────────────────
+    print("\n🧠 Initialisation des embeddings OpenAI...")
+    
+    try:
+        embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            openai_api_key=api_key,
+        )
+        print("✓ Embeddings OpenAI prêts")
+    except Exception as e:
+        print(f"❌ ERREUR OpenAI: {e}")
+        print("   Vérifiez votre clé API")
+        exit(1)
 
-    print("\n✅ TOUS LES EMBEDDINGS CRÉÉS ET STOCKÉS!")
+    # ──────────────────────────────────────────────────────────────────────────
+    # ÉTAPE 6: Créer ChromaDB
+    # ──────────────────────────────────────────────────────────────────────────
+    print("\n💾 Initialisation de ChromaDB...")
+    
+    chroma_dir = "data/chroma_db"
+    
+    # Supprimer l'ancienne base
+    if Path(chroma_dir).exists():
+        shutil.rmtree(chroma_dir)
+        print(f"✓ Ancienne base supprimée")
+    
+    try:
+        print("⏳ Création des embeddings (peut prendre 1-2 minutes)...")
+        vectorstore = Chroma.from_documents(
+            documents=split_docs,
+            embedding=embeddings,
+            persist_directory=chroma_dir,
+            collection_name="jobs",
+        )
+        print(f"✓ ChromaDB créée avec {len(split_docs)} chunks")
+    except Exception as e:
+        print(f"❌ ERREUR ChromaDB: {e}")
+        exit(1)
 
-    # ÉTAPE 6: Test de recherche
+    # ──────────────────────────────────────────────────────────────────────────
+    # ÉTAPE 7: Test de recherche
+    # ──────────────────────────────────────────────────────────────────────────
     print("\n🧪 TEST DE RECHERCHE:")
     print("-" * 70)
+    
+    test_query = "métier créatif bien payé"
+    print(f"Question: '{test_query}'\n")
+    
+    try:
+        results = vectorstore.similarity_search(test_query, k=3)
+        
+        if results:
+            print("📊 Top 3 résultats:")
+            for i, doc in enumerate(results, 1):
+                print(f"\n{i}. {doc.metadata.get('title', 'N/A')}")
+                print(f"   Secteur: {doc.metadata.get('sector', 'N/A')}")
+                print(f"   Salaire: {doc.metadata.get('salary_min')}-{doc.metadata.get('salary_max')} EUR")
+        else:
+            print("⚠️  Aucun résultat trouvé")
+    except Exception as e:
+        print(f"⚠️  Erreur lors du test: {e}")
 
-    test_query = "métiers créatifs bien payés"
-    print(f"Question test: '{test_query}'")
-
-    # Créer l'embedding de la question
-    query_embedding = model.encode([test_query])
-
-    # Rechercher dans ChromaDB
-    results = collection.query(
-        query_embeddings=query_embedding.tolist(),
-        n_results=3
-    )
-
-    print("\n📊 Top 3 résultats:")
-    for i, (doc, metadata) in enumerate(zip(results['documents'][0], results['metadatas'][0]), 1):
-        print(f"\n{i}. {metadata['title']}")
-        print(f"   Secteur: {metadata['sector']}")
-        print(f"   Salaire: {metadata['salary_min']}-{metadata['salary_max']} EUR")
-
-    # ÉTAPE 7: Statistiques finales
-    print("\n" + "="*70)
+    # ──────────────────────────────────────────────────────────────────────────
+    # RÉSUMÉ
+    # ──────────────────────────────────────────────────────────────────────────
+    print("\n" + "=" * 70)
     print("✅ BASE DE DONNÉES RAG CRÉÉE AVEC SUCCÈS!")
-    print("="*70)
-    print(f"✓ Métiers vectorisés: {len(jobs)}")
-    print(f"✓ Emplacement: {chroma_dir}")
-    print(f"✓ Collection: 'jobs'")
-    print(f"✓ Modèle: paraphrase-multilingual-MiniLM-L12-v2")
-    print("\n💡 Prochaine étape: Créer l'API de recherche Next.js")
-    print("="*70)
+    print("=" * 70)
+    print(f"📊 Métiers source     : {len(jobs)}")
+    print(f"📊 Chunks vectorisés  : {len(split_docs)}")
+    print(f"📁 Emplacement        : {chroma_dir}")
+    print(f"🔑 Embeddings         : text-embedding-3-small (OpenAI)")
+    print(f"💾 Base de données    : ChromaDB")
+    print("=" * 70)
+    print("\n✨ Vous pouvez maintenant utiliser la RAG dans votre chatbot!")
 
-    return collection
+    return vectorstore
+
 
 if __name__ == "__main__":
-    setup_rag_database()
+    try:
+        setup_rag_database()
+    except KeyboardInterrupt:
+        print("\n❌ Interruption utilisateur")
+    except Exception as e:
+        print(f"\n❌ ERREUR FATALE: {e}")
+        import traceback
+        traceback.print_exc()

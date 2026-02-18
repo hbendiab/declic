@@ -1,83 +1,96 @@
 #!/usr/bin/env python3
 """
-Script de recherche dans la base ChromaDB
-Appelé par l'API Next.js
+Script de recherche sémantique dans ChromaDB via LangChain
+Appelé par l'API Next.js via subprocess
 """
 
 import sys
 import json
+import os
 from pathlib import Path
-from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.config import Settings
+from dotenv import load_dotenv
 
-def search_jobs(query: str, n_results: int = 5):
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+
+# Charger les variables d'environnement
+load_dotenv(".env.local")
+
+
+def search_jobs(query: str, n_results: int = 5) -> dict:
     """
-    Recherche des métiers dans ChromaDB
+    Recherche sémantique des métiers dans ChromaDB via LangChain
 
     Args:
-        query: Question de l'utilisateur
+        query: Question ou description de l'utilisateur
         n_results: Nombre de résultats à retourner
 
     Returns:
         dict: Résultats de recherche avec métadonnées
     """
 
-    # Charger le modèle (mis en cache après le premier chargement)
-    model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"error": "OPENAI_API_KEY manquante", "jobs": []}
 
-    # Connecter à ChromaDB
-    chroma_dir = Path("data/chroma_db")
-    client = chromadb.PersistentClient(
-        path=str(chroma_dir),
-        settings=Settings(anonymized_telemetry=False)
+    # Initialiser les embeddings OpenAI
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        openai_api_key=api_key,
     )
 
-    # Récupérer la collection
-    collection = client.get_collection("jobs")
+    # Connecter à ChromaDB existant
+    chroma_dir = "data/chroma_db"
+    if not Path(chroma_dir).exists():
+        return {"error": "Base ChromaDB introuvable. Lancez setup_rag.py d'abord.", "jobs": []}
 
-    # Créer l'embedding de la query
-    query_embedding = model.encode([query])
-
-    # Rechercher dans ChromaDB
-    results = collection.query(
-        query_embeddings=query_embedding.tolist(),
-        n_results=n_results
+    vectorstore = Chroma(
+        persist_directory=chroma_dir,
+        embedding_function=embeddings,
+        collection_name="jobs",
     )
 
-    # Formatter les résultats
+    # Recherche avec score de similarité
+    results_with_scores = vectorstore.similarity_search_with_relevance_scores(
+        query,
+        k=n_results,
+    )
+
+    # Dédupliquer par titre (un même métier peut avoir plusieurs chunks)
+    seen_titles = set()
     jobs = []
-    for i in range(len(results['ids'][0])):
-        job = {
-            'id': results['ids'][0][i],
-            'title': results['metadatas'][0][i]['title'],
-            'sector': results['metadatas'][0][i]['sector'],
-            'salary_min': results['metadatas'][0][i]['salary_min'],
-            'salary_max': results['metadatas'][0][i]['salary_max'],
-            'slug': results['metadatas'][0][i]['slug'],
-            'url': results['metadatas'][0][i].get('url', ''),
-            'distance': results['distances'][0][i] if 'distances' in results else None,
-            'document': results['documents'][0][i]
-        }
-        jobs.append(job)
+
+    for doc, score in results_with_scores:
+        title = doc.metadata.get('title', '')
+        if title in seen_titles:
+            continue
+        seen_titles.add(title)
+
+        jobs.append({
+            'title': title,
+            'sector': doc.metadata.get('sector', ''),
+            'salary_min': doc.metadata.get('salary_min', ''),
+            'salary_max': doc.metadata.get('salary_max', ''),
+            'slug': doc.metadata.get('slug', ''),
+            'url': doc.metadata.get('url', ''),
+            'relevance_score': round(score, 4),
+            'excerpt': doc.page_content[:300],
+        })
 
     return {
         'query': query,
-        'n_results': n_results,
-        'jobs': jobs
+        'n_results': len(jobs),
+        'jobs': jobs,
     }
 
+
 if __name__ == "__main__":
-    # Récupérer les arguments de la ligne de commande
     if len(sys.argv) < 2:
-        print(json.dumps({"error": "Query required"}))
+        print(json.dumps({"error": "Usage: python search_jobs.py <query> [n_results]"}))
         sys.exit(1)
 
     query = sys.argv[1]
     n_results = int(sys.argv[2]) if len(sys.argv) > 2 else 5
 
-    # Effectuer la recherche
     results = search_jobs(query, n_results)
-
-    # Retourner les résultats en JSON
-    print(json.dumps(results, ensure_ascii=False))
+    print(json.dumps(results, ensure_ascii=False, indent=2))

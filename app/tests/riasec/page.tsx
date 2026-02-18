@@ -184,7 +184,7 @@ export default function RiasecTestPage() {
                 Test RIASEC 🎯
               </h1>
               <p className="text-gray-600 font-body">
-                Découvre tes intérêts professionnels
+                DECOUVRES tes intérêts professionnels
               </p>
             </div>
             <Badge variant="primary">

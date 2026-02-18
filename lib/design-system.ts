@@ -79,7 +79,7 @@ export const availableTests = [
     id: 'riasec',
     name: 'RIASEC',
     subtitle: 'Holland Code',
-    description: 'Découvre tes intérêts professionnels',
+    description: 'DECOUVRES tes intérêts professionnels',
     duration: '5-7 min',
     questions: 18,
     icon: '🎯',
